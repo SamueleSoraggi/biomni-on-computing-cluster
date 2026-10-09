@@ -1,0 +1,17 @@
+#!/bin/bash
+# Stop your Biomni web UI session(s) and free the compute node.
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+# shellcheck source=/dev/null
+source "$HERE/course.conf"
+
+jobs=$(squeue -h -u "$USER" -n biomni-ui -o %i)
+if [ -z "$jobs" ]; then
+    echo "You have no Biomni session running."
+else
+    # shellcheck disable=SC2086
+    scancel $jobs
+    echo "Stopped your Biomni session."
+fi
+echo "Your results are in: $WORK_DIR"

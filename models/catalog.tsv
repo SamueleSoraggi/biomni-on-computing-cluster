@@ -1,0 +1,5 @@
+# Open models that biomni-model can download and serve (tab-separated).
+# name	huggingface repo	partition	gpus	download size	extra vLLM arguments
+gpt-oss-20b	openai/gpt-oss-20b	gpu-l40s	1	13GB	--max-model-len 131072 --gpu-memory-utilization 0.92
+gpt-oss-120b	openai/gpt-oss-120b	gpu-h200	1	65GB	--max-model-len 131072 --gpu-memory-utilization 0.92
+qwen3-30b	Qwen/Qwen3-30B-A3B-Instruct-2507-FP8	gpu-l40s	1	31GB	--max-model-len 65536 --gpu-memory-utilization 0.95

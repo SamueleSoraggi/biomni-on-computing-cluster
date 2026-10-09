@@ -1,0 +1,32 @@
+# Container images (7-8 GB each) - rebuild with build.sbatch / re-pull vLLM (see README)
+*.sif
+
+# Biomni data lake (~14 GB) - re-download with jobs/download_datalake.sbatch
+data/
+
+# Open models: keep only the catalog; weights, server key and live endpoint stay local
+models/*
+!models/catalog.tsv
+
+# Logs of builds, downloads and model servers (folder kept: build.sbatch writes into it)
+logs/*
+!logs/.gitkeep
+
+# Local test homes and working notes
+.testhome/
+STATUS.md
+
+# Python / tool caches
+__pycache__/
+*.py[cod]
+.pybiomart.sqlite
+
+# Secrets that must never be committed
+.env
+*.env
+.server_key
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

@@ -1,0 +1,105 @@
+#!/bin/bash
+# Run a command inside the Biomni container with cluster-friendly defaults.
+#
+#   biomni-exec python my_task.py
+#   biomni-exec python -c 'from biomni.agent import A1; ...'
+#   biomni-exec bash                      # interactive shell inside the image
+#
+# Environment knobs (all optional):
+#   BIOMNI_SIF        image to use              (default: ../biomni.sif next to this script)
+#   BIOMNI_DATA_PATH  data lake parent dir      (default: <repo>/data; holds biomni_data/data_lake)
+#   BIOMNI_BIND       extra binds, comma-separated "src[:dst[:opts]]"
+#   BIOMNI_GPU        1 = force --nv, 0 = never  (default: auto, if nvidia-smi works)
+#   BIOMNI_ENV_FILE   env file with API keys     (default: ~/.biomni.env if it exists)
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+SIF=${BIOMNI_SIF:-$HERE/biomni.sif}
+[ -f "$SIF" ] || { echo "biomni-exec: image not found: $SIF (set BIOMNI_SIF)" >&2; exit 1; }
+
+export BIOMNI_DATA_PATH=${BIOMNI_DATA_PATH:-$HERE/data}
+mkdir -p "$BIOMNI_DATA_PATH"
+
+# Per-job scratch: SLURM's node-local $TMPDIR when available
+SCRATCH=${TMPDIR:-/tmp}
+mkdir -p "$SCRATCH"
+
+args=(--cleanenv --pwd "$PWD" --bind "$SCRATCH")
+args+=(--bind "$BIOMNI_DATA_PATH")
+[ -n "${BIOMNI_BIND:-}" ] && args+=(--bind "$BIOMNI_BIND")
+
+# GPU passthrough
+case "${BIOMNI_GPU:-auto}" in
+    1) args+=(--nv) ;;
+    auto) if [ -n "${CUDA_VISIBLE_DEVICES:-}" ] || nvidia-smi -L >/dev/null 2>&1; then args+=(--nv); fi ;;
+esac
+
+# --cleanenv drops the host environment (host conda/PYTHONPATH/modules would break the image);
+# forward only what Biomni needs: LLM credentials/config and SLURM/thread settings.
+# Passed as APPTAINERENV_* (not --env) so keys never appear on a command line other users can see.
+pass_env() { export "APPTAINERENV_$1=$2"; }
+forward=(
+    ANTHROPIC_API_KEY OPENAI_API_KEY OPENAI_ENDPOINT AZURE_OPENAI_API_KEY AZURE_OPENAI_ENDPOINT
+    GEMINI_API_KEY GOOGLE_API_KEY GROQ_API_KEY LLM_SOURCE
+    AWS_BEARER_TOKEN_BEDROCK AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_REGION AWS_PROFILE
+    CUSTOM_MODEL_BASE_URL CUSTOM_MODEL_API_KEY
+    HF_TOKEN NCBI_API_KEY NCBI_EMAIL PROTOCOLS_IO_ACCESS_TOKEN SYNAPSE_AUTH_TOKEN RESULTS_FOLDER
+    HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy
+    GRADIO_SERVER_PORT GRADIO_SERVER_NAME
+    TERM USER LOGNAME TMPDIR CUDA_VISIBLE_DEVICES
+    OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS NUMBA_NUM_THREADS
+)
+for v in "${forward[@]}"; do
+    if [ -n "${!v:-}" ]; then pass_env "$v" "${!v}"; fi
+done
+# Every BIOMNI_* (agent config: BIOMNI_LLM, BIOMNI_SOURCE, ...) and SLURM_* variable
+while IFS='=' read -r k _; do
+    pass_env "$k" "${!k}"
+done < <(env | grep -E '^(BIOMNI_|SLURM_)[A-Za-z0-9_]*=' | grep -vE '^BIOMNI_(SIF|BIND|GPU|ENV_FILE)=' || true)
+
+# Default thread count = allocated CPUs, so numpy/torch don't oversubscribe a shared node
+if [ -z "${OMP_NUM_THREADS:-}" ] && [ -n "${SLURM_CPUS_PER_TASK:-}" ]; then
+    for v in OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS NUMBA_NUM_THREADS; do
+        pass_env "$v" "$SLURM_CPUS_PER_TASK"
+    done
+fi
+
+# API keys from a private env file (KEY=VALUE lines); a ./.env in the working dir is also read by Biomni
+ENV_FILE=${BIOMNI_ENV_FILE:-$HOME/.biomni.env}
+[ -f "$ENV_FILE" ] && args+=(--env-file "$ENV_FILE")
+
+# "Free course model" (biomni-setup option 0): use the shared open-model server started with
+# `biomni-model start`, wherever it is running right now
+if [ -f "$ENV_FILE" ] && grep -qx 'BIOMNI_COURSE_MODEL=1' "$ENV_FILE"; then
+    if [ ! -r "$HERE/models/endpoint" ]; then
+        echo "The free course model is not running right now. Please ask your teacher to start it." >&2
+        exit 3
+    fi
+    URL=$(sed -n 's/^URL=//p' "$HERE/models/endpoint"); MODEL=$(sed -n 's/^MODEL=//p' "$HERE/models/endpoint")
+    hostport=${URL#http://}; hostport=${hostport%%/*}
+    # CPU compute nodes cannot reach the GPU nodes directly; the login nodes can. If the server
+    # does not answer from here, forward a local port to it through a login node (passwordless
+    # intra-cluster ssh). The tunnel lives in this job's cgroup and ends with the job.
+    if ! curl --noproxy '*' -s --connect-timeout 3 -o /dev/null "$URL/models"; then
+        # shellcheck source=/dev/null
+        TUNNEL_HOST=$(source "$HERE/course.conf"; echo "${TUNNEL_HOST:-}")
+        lport=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+        if ! ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ExitOnForwardFailure=yes \
+                 -o ServerAliveInterval=30 -f -N -L "127.0.0.1:$lport:$hostport" "${TUNNEL_HOST:?set TUNNEL_HOST in course.conf}"; then
+            echo "Could not connect to the course model (via $TUNNEL_HOST). Please tell your teacher." >&2
+            exit 3
+        fi
+        URL=http://127.0.0.1:$lport/v1
+    fi
+    pass_env BIOMNI_SOURCE Custom
+    pass_env BIOMNI_CUSTOM_BASE_URL "$URL"
+    pass_env BIOMNI_CUSTOM_API_KEY "$(cat "$HERE/models/.server_key")"
+    pass_env BIOMNI_LLM "$MODEL"
+    # The server is inside the cluster: never route it through an HTTP proxy
+    host=${URL#http://}; host=${host%%:*}
+    pass_env NO_PROXY "${NO_PROXY:+$NO_PROXY,}$host,localhost,127.0.0.1"
+    pass_env no_proxy "${no_proxy:+$no_proxy,}$host,localhost,127.0.0.1"
+fi
+
+[ $# -eq 0 ] && set -- python
+exec apptainer exec "${args[@]}" "$SIF" "$@"

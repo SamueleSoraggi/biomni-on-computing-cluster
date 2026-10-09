@@ -1,0 +1,69 @@
+#!/bin/bash
+# One-time setup for a student: saves their API key privately and adds the biomni
+# commands to their PATH. Safe to run again (e.g. to change key or model).
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+# shellcheck source=/dev/null
+source "$HERE/course.conf"
+ENV_FILE=$HOME/.biomni.env
+
+bold=$(tput bold 2>/dev/null || true); norm=$(tput sgr0 2>/dev/null || true)
+echo "${bold}Biomni setup${norm}"
+echo
+
+# 1. PATH, so biomni-start / biomni-stop work from any directory
+if ! grep -qs "$HERE/bin" "$HOME/.bashrc"; then
+    printf '\n# Biomni course commands\nexport PATH="%s/bin:$PATH"\n' "$HERE" >> "$HOME/.bashrc"
+    echo "✓ Added the biomni commands to your ~/.bashrc"
+else
+    echo "✓ The biomni commands are already in your ~/.bashrc"
+fi
+
+finish() {
+    mkdir -p "$WORK_DIR"
+    echo
+    echo "${bold}Setup done.${norm} Now type:  ${bold}source ~/.bashrc${norm}   (only needed this first time)"
+    echo "Then start Biomni with:      ${bold}biomni-start${norm}"
+}
+
+# 2. Which AI model. The settings file is written so only you can read it.
+umask 077
+echo
+echo "Which AI model should Biomni use?"
+echo "  0) The free course model run by your teacher (no API key, no cost)"
+echo "  1) Anthropic (Claude) with your own API key - key starts with sk-ant-"
+echo "  2) OpenAI (GPT) with your own API key       - key starts with sk-"
+echo "  3) Google (Gemini) with your own API key"
+read -rp "Type 0, 1, 2 or 3 and press Enter: " choice
+case "$choice" in
+    0)
+        printf '# Created by biomni-setup on %s: use the free course model.\nBIOMNI_COURSE_MODEL=1\n' "$(date +%F)" > "$ENV_FILE"
+        chmod 600 "$ENV_FILE"
+        echo "✓ Biomni will use the free course model"
+        finish
+        exit 0 ;;
+    1) var=ANTHROPIC_API_KEY; model=$DEFAULT_ANTHROPIC_MODEL ;;
+    2) var=OPENAI_API_KEY;    model=$DEFAULT_OPENAI_MODEL ;;
+    3) var=GEMINI_API_KEY;    model=$DEFAULT_GEMINI_MODEL ;;
+    *) echo "Please run biomni-setup again and type 0, 1, 2 or 3."; exit 1 ;;
+esac
+
+echo
+echo "Paste your API key and press Enter (nothing will be shown while you paste - that is normal):"
+read -rs key
+echo
+key=$(printf '%s' "$key" | tr -d '[:space:]')
+if [ ${#key} -lt 20 ]; then
+    echo "That key looks too short. Please run biomni-setup again and paste the whole key."
+    exit 1
+fi
+
+cat > "$ENV_FILE" <<EOF
+# Created by biomni-setup on $(date +%F). Only you can read this file.
+$var=$key
+BIOMNI_LLM=$model
+EOF
+chmod 600 "$ENV_FILE"
+echo "✓ Key saved in $ENV_FILE (model: $model)"
+finish

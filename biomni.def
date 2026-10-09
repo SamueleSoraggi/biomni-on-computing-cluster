@@ -1,0 +1,135 @@
+Bootstrap: docker
+From: ubuntu:22.04
+
+# Biomni (https://github.com/snap-stanford/biomni) "E1" environment as one Apptainer image.
+#
+# Build (unprivileged, see build.sbatch):
+#   apptainer build --fakeroot --build-arg BIOMNI_REF=<git ref> biomni.sif biomni.def
+#
+# Conda environments inside /opt/conda/envs:
+#   biomni_e1      Python 3.11 agent env (upstream pinned biomni_env/fixed_env.yml) + biomni itself
+#   biomni_r       R 4.4 + CRAN/Bioconductor packages Biomni advertises (DESeq2, edgeR, WGCNA, ...)
+#   biomni_tools   standalone CLI tools (plink2, gcta64, iqtree2, FastTree, muscle, HOMER, ...)
+#   bio_env_py310  cnvkit (Biomni calls it via `conda run -n bio_env_py310`)
+# biomni_e1 is first on PATH; biomni_r then biomni_tools are appended so they never shadow its python
+# (biomni_r before biomni_tools: mageck drags its own bare R into biomni_tools).
+
+%arguments
+    BIOMNI_REF=400c1f366b96a35ca253e13c9b06c5076af41d65
+
+%labels
+    org.opencontainers.image.title biomni
+    org.opencontainers.image.source https://github.com/snap-stanford/biomni
+    biomni.git_ref {{ BIOMNI_REF }}
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    export CONDA_PREFIX=/opt/conda/envs/biomni_e1
+    export CONDA_DEFAULT_ENV=biomni_e1
+    export PATH=/opt/conda/envs/biomni_e1/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/conda/envs/biomni_r/bin:/opt/conda/envs/biomni_tools/bin
+    # Image is read-only, so pip falls back to --user: keep those installs in their own
+    # user base instead of the host's ~/.local (which holds packages for other Pythons)
+    export PYTHONUSERBASE=${PYTHONUSERBASE:-$HOME/.local/biomni-py311}
+    export PATH=$PATH:$PYTHONUSERBASE/bin
+    # The image is read-only: point caches at writable locations (overridable by the caller)
+    export MPLCONFIGDIR=${MPLCONFIGDIR:-${TMPDIR:-/tmp}/mpl-$USER}
+    export NUMBA_CACHE_DIR=${NUMBA_CACHE_DIR:-${TMPDIR:-/tmp}/numba-$USER}
+    export GRADIO_TEMP_DIR=${GRADIO_TEMP_DIR:-${TMPDIR:-/tmp}/gradio-$USER}
+    export HF_HOME=${HF_HOME:-$HOME/.cache/huggingface}
+    # R packages installed at runtime by the agent go to the user's library, not the image
+    export R_LIBS_USER=${R_LIBS_USER:-$HOME/R/biomni-library}
+
+%post -c /bin/bash
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    export MAMBA_ROOT_PREFIX=/opt/conda
+    export PIP_NO_CACHE_DIR=1
+
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl wget git git-lfs bzip2 unzip zip jq less nano procps \
+        build-essential pkg-config locales tzdata \
+        libgl1 libglib2.0-0 libxrender1 libxext6 libsm6 libfontconfig1 \
+        libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b
+    rm -rf /var/lib/apt/lists/*
+    git lfs install --system
+
+    # micromamba + a `conda` shim (Biomni shells out to `conda run -n <env> ...`)
+    curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xj -C /usr/local bin/micromamba
+    mkdir -p /opt/conda
+    cat > /usr/local/bin/conda <<'EOF'
+#!/bin/bash
+export MAMBA_ROOT_PREFIX=${MAMBA_ROOT_PREFIX:-/opt/conda}
+exec /usr/local/bin/micromamba "$@"
+EOF
+    chmod +x /usr/local/bin/conda
+    printf 'channels:\n  - conda-forge\n  - bioconda\nchannel_priority: flexible\n' > /opt/conda/.condarc
+
+    # Biomni source at a pinned ref
+    git clone https://github.com/snap-stanford/biomni.git /opt/biomni-src
+    git -C /opt/biomni-src checkout {{ BIOMNI_REF }}
+    ENVDIR=/opt/biomni-src/biomni_env
+
+    # ---- 1. biomni_e1: upstream pinned Python env (drop the Anaconda `defaults` channel) ----
+    sed '/^  - defaults$/d' $ENVDIR/fixed_env.yml > /tmp/fixed_env.yml
+    micromamba create -y -n biomni_e1 -f /tmp/fixed_env.yml
+    E1=/opt/conda/envs/biomni_e1/bin
+    $E1/pip install "/opt/biomni-src[gradio]"
+    # Extras from biomni_env/new_software_v008.sh and extra LLM providers (lightweight subset)
+    # Constrained to the pinned versions so an extra can never silently upgrade the core env
+    $E1/pip list --format=freeze --exclude-editable | grep -v '^biomni==' > /tmp/pins.txt
+    # (langchain-aws is left out: every release conflicts with the pinned boto3/langchain-core/numpy)
+    for pkg in langchain-google-genai pybiomart mi-googlesearch-python lazyslide; do
+        $E1/pip install -c /tmp/pins.txt "$pkg" || echo "WARNING: optional extra $pkg not installed"
+    done
+
+    # ---- 2. biomni_r: R + packages from r_packages.yml / install_r_packages.R (via conda, no source builds) ----
+    # R 4.4 (Bioconductor 3.20): with R 4.5 the solver falls back to an xcms built for R 3.2
+    # tbb<2021: the dada2 build uses the old tbb::task API (removed in oneTBB 2021)
+    micromamba create -y -n biomni_r -c conda-forge -c bioconda \
+        "r-base=4.4" r-essentials r-devtools r-remotes r-lme4 r-harmony r-wgcna r-matrix r-rcpp \
+        bioconductor-deseq2 bioconductor-edger bioconductor-limma bioconductor-clusterprofiler \
+        bioconductor-dada2 "bioconductor-xcms>=4" bioconductor-flowcore \
+        "tbb<2021"
+
+    # ---- 3. biomni_tools: CLI tools from biomni_env/cli_tools_config.json + ones commented out of fixed_env ----
+    # One at a time so a single unsolvable tool doesn't fail the build
+    # iqtree=2: Biomni calls `iqtree2`; IQ-TREE 3 only ships `iqtree3`
+    micromamba create -y -n biomni_tools -c conda-forge -c bioconda plink2 "iqtree=2" fasttree muscle
+    for t in plink gcta homer mageck; do
+        micromamba install -y -n biomni_tools -c conda-forge -c bioconda "$t" || echo "WARNING: $t not installed"
+    done
+    # plannotate has tight pins; keep it isolated and optional
+    micromamba create -y -n plannotate -c conda-forge -c bioconda plannotate \
+        && ln -s /opt/conda/envs/plannotate/bin/plannotate /usr/local/bin/plannotate \
+        || echo "WARNING: plannotate not installed"
+
+    # ---- 4. bio_env_py310: cnvkit ----
+    sed '/^  - defaults$/d' $ENVDIR/bio_env_py310.yml > /tmp/bio_env_py310.yml
+    micromamba create -y -n bio_env_py310 -f /tmp/bio_env_py310.yml
+
+    micromamba clean -a -y
+    find /opt/conda -name '__pycache__' -prune -o -name '*.a' -type f -delete 2>/dev/null || true
+    chmod -R a+rX /opt/conda /opt/biomni-src
+
+%runscript
+    # `apptainer run biomni.sif script.py` -> python from biomni_e1; no args -> interactive python
+    if [ $# -eq 0 ]; then exec python; fi
+    case "$1" in
+        *.py) exec python "$@" ;;
+        *)    exec "$@" ;;
+    esac
+
+%test
+    set -e
+    export PATH=/opt/conda/envs/biomni_e1/bin:$PATH:/opt/conda/envs/biomni_r/bin:/opt/conda/envs/biomni_tools/bin
+    python -c "import biomni, biomni.agent; print('biomni', biomni.__version__ if hasattr(biomni,'__version__') else 'ok')"
+    python -c "import scanpy, rdkit, gseapy, torch, langchain_google_genai, pybiomart; print('python stack ok')"
+    for t in Rscript samtools bwa bowtie2 bedtools blastn mafft fastqc plink plink2 gcta64 iqtree2 FastTree muscle findMotifsGenome.pl mageck macs2 diamond plannotate; do
+        command -v $t >/dev/null || { echo "missing $t"; exit 1; }
+    done
+    [ "$(command -v Rscript)" = /opt/conda/envs/biomni_r/bin/Rscript ] || { echo "wrong Rscript: $(command -v Rscript)"; exit 1; }
+    Rscript -e 'for (p in c("DESeq2","edgeR","limma","WGCNA","clusterProfiler","harmony","dada2","xcms","flowCore","lme4","ggplot2")) suppressMessages(library(p, character.only=TRUE)); cat("R ok\n")'
+    /usr/local/bin/conda run -n bio_env_py310 cnvkit.py version

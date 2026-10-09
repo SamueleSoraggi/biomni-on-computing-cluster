@@ -1,0 +1,100 @@
+#!/bin/bash
+# Start (or show) your Biomni web UI session. Run this on the login node:
+#   biomni-start
+# The UI itself runs on a compute node; this prints how to open it in your browser.
+# If a session is already running, it just shows its details again.
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+# shellcheck source=/dev/null
+source "$HERE/course.conf"
+STATE_DIR=$WORK_DIR/.sessions
+umask 077
+mkdir -p "$STATE_DIR"
+
+bold=$(tput bold 2>/dev/null || true); norm=$(tput sgr0 2>/dev/null || true)
+die() { echo "$*" >&2; exit 1; }
+
+[ -f "$HOME/.biomni.env" ] || die "You have not saved an API key yet. Run:  $HERE/bin/biomni-setup"
+[ -f "$HERE/biomni.sif" ] || die "Biomni is not installed in $HERE (biomni.sif missing). Please tell your teacher."
+if grep -qsx 'BIOMNI_COURSE_MODEL=1' "$HOME/.biomni.env" && [ ! -r "$HERE/models/endpoint" ]; then
+    die "The free course model is not running right now. Please ask your teacher to start it, then try again."
+fi
+
+show_session() {
+    local jobid=$1 NODE PORT SESSION_DIR
+    # shellcheck source=/dev/null
+    source "$STATE_DIR/session.$jobid"
+    local password; password=$(cat "$STATE_DIR/password.$jobid")
+    local left; left=$(squeue -h -j "$jobid" -o %L 2>/dev/null || true)
+    cat <<EOF
+
+${bold}Biomni is running${norm} on compute node $NODE (time left: ${left:-?}).
+
+${bold}Step 1 - connect your browser to it.${norm} Choose ONE way:
+
+  a) Terminal: open a NEW terminal window ON YOUR OWN COMPUTER and run
+       ${bold}ssh -N -L 7860:$NODE:$PORT $USER@$LOGIN_HOST${norm}
+     log in as usual, then leave that window open (it shows nothing - that is normal).
+
+  b) VS Code: in the PORTS tab click "Forward a Port", type ${bold}$NODE:$PORT${norm}
+     and press Enter. Then use the "Forwarded Address" shown there instead of localhost:7860.
+
+${bold}Step 2${norm} - open  ${bold}http://localhost:7860${norm}  in your browser and log in with
+     Username: ${bold}$USER${norm}
+     Password: ${bold}$password${norm}
+
+Files Biomni creates are saved in:  $SESSION_DIR
+When you are done, run  ${bold}biomni-stop${norm}  (otherwise it stops by itself when time runs out).
+
+EOF
+}
+
+# Already running? Show it instead of starting a second session.
+running=$(squeue -h -u "$USER" -n biomni-ui -t RUNNING -o %i | head -1)
+if [ -n "$running" ] && grep -qs "Running on local URL" "$STATE_DIR/ui-$running.log"; then
+    show_session "$running"
+    exit 0
+fi
+
+jobid=$(squeue -h -u "$USER" -n biomni-ui -o %i | head -1)
+if [ -z "$jobid" ]; then
+    SESSION_DIR=$WORK_DIR/session_$(date +%Y-%m-%d_%H%M)
+    mkdir -p "$SESSION_DIR"
+    # Held until the password file exists, so the job never starts without it
+    jobid=$(BIOMNI_REPO=$HERE BIOMNI_SESSION_DIR=$SESSION_DIR BIOMNI_STATE_DIR=$STATE_DIR \
+        sbatch --parsable --hold \
+            --account="$ACCOUNT" --partition="$PARTITION" --cpus-per-task="$CPUS" \
+            --mem="$MEM" --time="$TIME" --output="$STATE_DIR/ui-%j.log" \
+            ${DATA_PATH:+--export=ALL,BIOMNI_DATA_PATH=$DATA_PATH} \
+            "$HERE/jobs/ui_session.sbatch")
+    python3 -c 'import secrets; print(secrets.token_urlsafe(9))' > "$STATE_DIR/password.$jobid"
+    scontrol release "$jobid"
+    echo "Started a Biomni session (job $jobid)."
+else
+    echo "Your Biomni session (job $jobid) is starting."
+fi
+
+echo "Waiting for it to be ready - this usually takes 1-3 minutes."
+echo "(You can press Ctrl+C at any time; the session keeps running. Run biomni-start again to see the details.)"
+said_queue=0
+while true; do
+    state=$(squeue -h -j "$jobid" -o %T 2>/dev/null || true)
+    if [ -z "$state" ]; then
+        echo
+        echo "The session stopped before it was ready. Last lines of its log:"
+        tail -n 15 "$STATE_DIR/ui-$jobid.log" 2>/dev/null || true
+        die "Please try biomni-start again, or show this message to your teacher."
+    fi
+    if [ "$state" = PENDING ] && [ $said_queue -eq 0 ]; then
+        echo "Waiting for a free compute node..."
+        said_queue=1
+    fi
+    if grep -qs "Running on local URL" "$STATE_DIR/ui-$jobid.log"; then
+        break
+    fi
+    printf '.'
+    sleep 5
+done
+echo
+show_session "$jobid"

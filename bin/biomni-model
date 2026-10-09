@@ -1,0 +1,100 @@
+#!/bin/bash
+# Instructor tool: download open models and run ONE shared model server that every
+# student's Biomni can use instead of a paid API key.
+#
+#   biomni-model list                      models you can use, and which are downloaded
+#   biomni-model download <name>           download a model (runs as a CPU job, once)
+#   biomni-model start <name> [hours] [partition] [gpus]
+#                                          start the shared server on a GPU (default 8 h)
+#   biomni-model status                    is it running, and where
+#   biomni-model stop                      stop the server
+#
+# Students pick "free course model" in biomni-setup; their sessions then use whatever
+# model is running here. Access is protected by a key readable only by the course group.
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+# shellcheck source=/dev/null
+source "$HERE/course.conf"
+MODELS=$HERE/models
+CATALOG=$MODELS/catalog.tsv
+
+die() { echo "$*" >&2; exit 1; }
+row() { awk -F'\t' -v n="$1" '!/^#/ && $1 == n' "$CATALOG"; }
+field() { row "$1" | cut -f"$2"; }
+downloaded() { [ -f "$MODELS/$1/config.json" ] && [ ! -e "$MODELS/$1/.downloading" ]; }
+server_job() { squeue -h -u "$USER" -n biomni-model -o %i | head -1; }
+
+cmd=${1:-help}; shift || true
+case "$cmd" in
+list)
+    printf '%-14s %-38s %-9s %-5s %-8s %s\n' NAME REPO GPU GPUS SIZE STATUS
+    grep -v '^#' "$CATALOG" | while IFS=$'\t' read -r name repo part gpus size _; do
+        if downloaded "$name"; then st=downloaded; elif [ -e "$MODELS/$name/.downloading" ]; then st=downloading; else st=-; fi
+        printf '%-14s %-38s %-9s %-5s %-8s %s\n' "$name" "$repo" "$part" "$gpus" "$size" "$st"
+    done
+    ;;
+download)
+    name=${1:?usage: biomni-model download <name>}
+    repo=$(field "$name" 2); [ -n "$repo" ] || die "Unknown model '$name'. See: biomni-model list"
+    downloaded "$name" && { echo "$name is already downloaded."; exit 0; }
+    mkdir -p "$MODELS/$name" "$HERE/logs"; touch "$MODELS/$name/.downloading"
+    # gpt-oss repos also carry duplicate weights for other runtimes (original/, metal/)
+    jobid=$(sbatch --parsable -A "$ACCOUNT" -p short -c 4 --mem 16G -t 06:00:00 \
+        -J "model-dl-$name" -o "$HERE/logs/model-download-$name-%j.log" \
+        --wrap "set -e; '$HERE/bin/biomni-exec' hf download '$repo' --local-dir '$MODELS/$name' \
+                    --exclude 'original/*' 'metal/*' && rm -f '$MODELS/$name/.downloading' && echo DOWNLOAD DONE")
+    echo "Downloading $repo ($(field "$name" 5)) as job $jobid."
+    echo "Follow it with: tail -f $HERE/logs/model-download-$name-$jobid.log"
+    ;;
+start)
+    name=${1:?usage: biomni-model start <name> [hours] [partition] [gpus]}; hours=${2:-8}
+    part=${3:-$(field "$name" 3)}; gpus=${4:-$(field "$name" 4)}
+    # More GPUs than the catalog says (e.g. 2 x L40S instead of 1 x H200): split the model across them
+    extra=$(field "$name" 6)
+    [ "$gpus" -gt 1 ] && ! grep -q -- --tensor-parallel-size <<<"$extra" && extra="$extra --tensor-parallel-size $gpus"
+    # vLLM's own GPU-to-GPU all-reduce hangs inside the container on these nodes (NCCL is fine)
+    [ "$gpus" -gt 1 ] && extra="$extra --disable-custom-all-reduce"
+    [ -n "$(row "$name")" ] || die "Unknown model '$name'. See: biomni-model list"
+    downloaded "$name" || die "$name is not downloaded yet. Run: biomni-model download $name"
+    ls "$MODELS"/vllm-*.sif >/dev/null 2>&1 || die "No vLLM image in $MODELS (see README: 'Open models')."
+    [ -z "$(server_job)" ] || die "A model server is already running (job $(server_job)). Stop it first: biomni-model stop"
+    # Course-wide key: readable by the project group (students), not by other cluster users
+    if [ ! -s "$MODELS/.server_key" ]; then
+        (umask 027; python3 -c 'import secrets; print(secrets.token_urlsafe(24))' > "$MODELS/.server_key")
+    fi
+    chmod 640 "$MODELS/.server_key"
+    mkdir -p "$HERE/logs"
+    jobid=$(BIOMNI_REPO=$HERE MODEL_NAME=$name VLLM_EXTRA=$extra \
+        sbatch --parsable -A "$ACCOUNT" -p "$part" --gres="gpu:$gpus" \
+            -c $((8 * gpus)) --mem=$((64 * gpus))G -t "$hours:00:00" \
+            -o "$HERE/logs/model-server-%j.log" "$HERE/jobs/model_server.sbatch")
+    echo "Starting $name as job $jobid (up to $hours h). Waiting until it answers - usually 3-10 minutes..."
+    while ! grep -qs "MODEL SERVER READY" "$HERE/logs/model-server-$jobid.log"; do
+        state=$(squeue -h -j "$jobid" -o %T || true)
+        [ -n "$state" ] || { tail -n 20 "$HERE/logs/model-server-$jobid.log" 2>/dev/null; die "The server stopped before it was ready."; }
+        [ "$state" = PENDING ] && printf 'p' || printf '.'
+        sleep 10
+    done
+    echo; grep "MODEL SERVER READY" "$HERE/logs/model-server-$jobid.log"
+    echo "Students who chose the free course model can now run biomni-start."
+    ;;
+status)
+    j=$(server_job)
+    if [ -z "$j" ]; then echo "No model server is running."; exit 0; fi
+    if [ -f "$MODELS/endpoint" ]; then
+        # shellcheck source=/dev/null
+        source "$MODELS/endpoint"
+        echo "Running: $MODEL at $URL (job $j, time left $(squeue -h -j "$j" -o %L))"
+    else
+        echo "Starting (job $j, $(squeue -h -j "$j" -o %T)). Log: $HERE/logs/model-server-$j.log"
+    fi
+    ;;
+stop)
+    j=$(server_job)
+    [ -n "$j" ] && scancel "$j" && echo "Stopped the model server (job $j)." || echo "No model server is running."
+    ;;
+*)
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+    ;;
+esac
